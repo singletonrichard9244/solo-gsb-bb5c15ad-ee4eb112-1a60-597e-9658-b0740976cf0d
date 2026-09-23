@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>剧场排练时序编排</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- ===== 加入/切换剧目 ===== -->
+<div id="join-overlay" class="overlay hidden">
+  <div class="overlay-card">
+    <h1>🎭 剧场排练时序编排</h1>
+    <p class="muted">多人实时协作 · Lamport 时钟 · 断线重连合并</p>
+    <label>你的昵称 <input id="join-name" maxlength="24" placeholder="导演 / 场记 / 音效…" /></label>
+    <div class="join-row">
+      <label class="grow">新建剧目标题 <input id="join-title" maxlength="120" placeholder="新剧目名称" /></label>
+      <button id="btn-new-play" class="primary">新建</button>
+    </div>
+    <div class="join-or">— 或选择已有剧目 —</div>
+    <div id="play-list" class="play-list">加载中…</div>
+  </div>
+</div>
+
+<!-- ===== 主界面 ===== -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="brand">🎭 <span id="play-title">未命名剧目</span></div>
+    <div class="toolbar">
+      <button id="btn-add-scene">＋ 场次</button>
+      <button id="btn-add-sound">＋ 音效</button>
+      <span class="divider"></span>
+      <button id="btn-export">⬇ 导出 JSON</button>
+      <button id="btn-import">⬆ 导入 JSON</button>
+      <input id="import-file" type="file" accept="application/json,.json" class="hidden" />
+      <span class="divider"></span>
+      <button id="btn-switch-play">切换剧目</button>
+    </div>
+    <div class="status-area">
+      <span id="conn-dot" class="dot" title="连接状态"></span>
+      <span id="conn-text">连接中…</span>
+      <span class="divider"></span>
+      <div id="members" class="members" title="在线成员"></div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="timeline-wrap">
+      <div id="timeline" class="timeline">
+        <div class="ruler">
+          <div class="ruler-spacer"></div>
+          <div id="ruler-track" class="ruler-track"></div>
+        </div>
+        <div id="lanes" class="lanes"></div>
+      </div>
+      <div id="empty-hint" class="empty-hint hidden">
+        时间线为空 —— 点击顶部「＋ 场次」开始第一次排练编排
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="tabs">
+        <button id="tab-detail" class="tab active">属性</button>
+        <button id="tab-cue" class="tab">📋 提示单</button>
+        <button id="tab-conflict" class="tab">冲突 <span id="conflict-count" class="badge hidden">0</span></button>
+        <button id="tab-log" class="tab">操作日志</button>
+      </div>
+
+      <div id="panel-detail" class="panel">
+        <div id="detail-empty" class="muted small pad">点击时间线上的元素查看 / 编辑属性。</div>
+        <div id="detail-form" class="hidden pad">
+          <div class="field"><label>类型</label><div id="d-kind" class="readonly"></div></div>
+          <div class="field"><label>名称</label><input id="d-name" type="text" maxlength="80" /></div>
+          <div class="field"><label>开始 (mm:ss.ms)</label><input id="d-start" type="text" placeholder="00:00.000" /></div>
+          <div class="field"><label>时长 (ms)</label><input id="d-duration" type="number" min="250" step="250" /></div>
+          <div class="field" id="d-parent-row"><label>所属场次</label>
+            <select id="d-parent"></select>
+          </div>
+          <div class="field"><label>元素 ID</label><div id="d-id" class="readonly mono small"></div></div>
+          <div class="btn-row">
+            <button id="btn-view-cue" class="hidden">📋 场次提示单</button>
+            <button id="btn-delete" class="danger">删除</button>
+            <button id="btn-restore" class="hidden">恢复</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="panel-cue" class="panel hidden">
+        <div class="cue-bar pad">
+          <label class="small muted">选择场次
+            <select id="cue-scene"></select>
+          </label>
+          <button id="btn-cue-print">🖨 打印 / 另存 PDF</button>
+        </div>
+        <div id="cue-content" class="cue-content"></div>
+      </div>
+
+      <div id="panel-conflict" class="panel hidden">
+        <div id="conflict-list" class="conflict-list"></div>
+      </div>
+
+      <div id="panel-log" class="panel hidden">
+        <div id="log-list" class="log-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<!-- ===== 打印专用：场次提示单（仅 @media print 且 body.printing 时可见） ===== -->
+<div id="cue-print" class="cue-print hidden" aria-hidden="true"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
