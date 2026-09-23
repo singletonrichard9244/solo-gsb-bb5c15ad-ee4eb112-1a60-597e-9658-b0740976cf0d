@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import Database
-from .engine import snapshot as build_snapshot
+from .engine import history_comparison, snapshot as build_snapshot
 from .ws import Manager, validate_op
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
@@ -178,6 +178,23 @@ async def play_state(play_id: str) -> dict:
         raise HTTPException(404, "剧目不存在")
     ops = await db.load_ops(play_id)
     return build_snapshot(ops)
+
+
+@app.get("/api/plays/{play_id}/history")
+async def play_history(play_id: str, opId: str) -> dict:
+    """Read-only causal-cut comparison anchored at one log entry.
+
+    The historical side folds only ops dominated by the anchor op's VV plus
+    its own seq (never an arrival-order / Lamport truncation); the current
+    side folds the whole live log. This endpoint mutates nothing.
+    """
+    if await db.play_title(play_id) is None:
+        raise HTTPException(404, "剧目不存在")
+    ops = await db.load_ops(play_id)
+    anchor = next((o for o in ops if o["opId"] == opId), None)
+    if anchor is None:
+        raise HTTPException(404, "该操作不存在于当前剧目日志中")
+    return history_comparison(ops, anchor)
 
 
 @app.patch("/api/plays/{play_id}")

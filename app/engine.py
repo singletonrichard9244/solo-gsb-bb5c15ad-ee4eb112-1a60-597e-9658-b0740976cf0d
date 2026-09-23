@@ -330,6 +330,164 @@ def build_view(state: dict) -> dict:
     }
 
 
+# ------------------------------------------------------------- history ----
+_KIND_ORDER = {"scene": 0, "action": 1, "sound": 2}
+_COMPARE_FIELDS = ("name", "start", "duration")
+
+
+def cut_version_vector(anchor: dict) -> dict[str, int]:
+    """VV defining the causal cut at ``anchor``.
+
+    The anchor's emitted VV is stamped *before* the op itself exists, so the
+    anchor's own per-client seq is added (max-wins) to make the cut include
+    the anchor.  Everything else comes straight from its causal context.
+    """
+    cutoff = {str(k): int(v) for k, v in (anchor.get("vv") or {}).items()}
+    cid = str(anchor["clientId"])
+    cutoff[cid] = max(cutoff.get(cid, 0), client_seq(anchor))
+    return cutoff
+
+
+def causal_cut(all_ops: list[dict], anchor: dict) -> list[dict]:
+    """Ops in the causal past of ``anchor`` (the anchor included).
+
+    An op belongs to the cut iff the anchor's cut VV dominates its
+    ``(clientId, clientSeq)`` — a purely causal predicate.  The result never
+    depends on arrival order, and ops are **not** truncated by Lamport value:
+    a concurrent op carrying a *smaller* lamport stays out (a plain
+    ``lamport <= anchor.lamport`` cutoff would wrongly include it), while a
+    causally-known op with a *larger* lamport stays in.
+    """
+    by_id: dict[str, dict] = {}
+    for op in all_ops:
+        by_id.setdefault(op["opId"], op)
+    cutoff = cut_version_vector(anchor)
+    return [
+        op
+        for op in by_id.values()
+        if int(cutoff.get(op["clientId"], 0)) >= client_seq(op)
+    ]
+
+
+def _visible_records(view: dict) -> dict[str, dict]:
+    """elemId -> element for everything the folded view actually shows.
+
+    Actions shadowed by a deleted/absent parent scene are deliberately not
+    present here, exactly as the view itself hides them.
+    """
+    recs: dict[str, dict] = {}
+    for scene in view["scenes"]:
+        recs[scene["id"]] = scene
+        for act in scene.get("actions", []):
+            recs[act["id"]] = act
+    for snd in view["sounds"]:
+        recs[snd["id"]] = snd
+    return recs
+
+
+def _field_snapshot(elem: dict) -> dict:
+    snap = {f: elem.get(f) for f in _COMPARE_FIELDS}
+    if elem.get("kind") == "action":
+        snap["parent"] = elem.get("parent")
+    return snap
+
+
+def _invisible_reason(elem_id: str, now_elements: dict[str, dict]) -> str | None:
+    """Why an element visible back then is invisible in the current view."""
+    elem = now_elements.get(elem_id)
+    if elem is None:
+        return None
+    if elem["deleted"]:
+        return "deleted"
+    if elem["kind"] == "action":
+        parent = now_elements.get(elem.get("parent"))
+        if parent is None or parent["deleted"]:
+            return "parent-deleted"
+    return None
+
+
+def diff_views(then_view: dict, now_view: dict) -> dict[str, list[dict]]:
+    """Align the *visible* elements of two folded views by element ID.
+
+    Returns ``{"added": [...], "removed": [...], "changed": [...]}``.  Each
+    entry carries ``kind``, ``status`` and per-field snapshots (``name`` /
+    ``start`` / ``duration``, plus ``parent`` for actions) of both sides;
+    ``changed`` entries add a ``changes`` list of ``{field, from, to}``.
+    Elements missing from the current side because their parent scene was
+    deleted are reported as removed with ``reason == "parent-deleted"``: the
+    shadowed action is invisible, just like the folded view treats it.
+    """
+    then_recs = _visible_records(then_view)
+    now_recs = _visible_records(now_view)
+    diff: dict[str, list[dict]] = {"added": [], "removed": [], "changed": []}
+
+    def _kind_order(eid: str) -> int:
+        e = now_recs.get(eid) or then_recs[eid]
+        return _KIND_ORDER.get(e["kind"], len(_KIND_ORDER))
+
+    for elem_id in sorted(set(then_recs) | set(now_recs),
+                          key=lambda i: (_kind_order(i), i)):
+        then_e = then_recs.get(elem_id)
+        now_e = now_recs.get(elem_id)
+        if then_e is None:
+            diff["added"].append({
+                "id": elem_id, "kind": now_e["kind"], "status": "added",
+                "then": None, "now": _field_snapshot(now_e),
+            })
+            continue
+        if now_e is None:
+            diff["removed"].append({
+                "id": elem_id, "kind": then_e["kind"], "status": "removed",
+                "then": _field_snapshot(then_e), "now": None,
+                "reason": _invisible_reason(elem_id, now_view["elements"]),
+            })
+            continue
+        kind = now_e["kind"]
+        fields = _COMPARE_FIELDS + (("parent",) if kind == "action" else ())
+        a, b = _field_snapshot(then_e), _field_snapshot(now_e)
+        changes = [
+            {"field": f, "from": a[f], "to": b[f]}
+            for f in fields if a[f] != b[f]
+        ]
+        if changes:
+            diff["changed"].append({
+                "id": elem_id, "kind": kind, "status": "changed",
+                "then": a, "now": b, "changes": changes,
+            })
+
+    for entries in diff.values():
+        entries.sort(key=lambda e: (_KIND_ORDER.get(e["kind"], len(_KIND_ORDER)),
+                                    e["id"]))
+    return diff
+
+
+def history_comparison(all_ops: list[dict], anchor: dict) -> dict:
+    """Read-only then-vs-now comparison at the causal cut of ``anchor``.
+
+    The historical side is fixed by the anchor's VV plus its own seq; only
+    ops inside that causal cut are folded — never an arrival-order prefix or
+    a Lamport cutoff.  The current side is folded from ``all_ops`` and thus
+    tracks live collaboration updates.  Pure function: emits no operations
+    and mutates nothing.
+    """
+    cut_ops = causal_cut(all_ops, anchor)
+    then_view = build_view(fold(cut_ops))
+    now_view = build_view(fold(all_ops))
+    return {
+        "anchor": {
+            "opId": anchor["opId"],
+            "type": anchor["type"],
+            "kind": anchor["kind"],
+            "elemId": anchor["elemId"],
+            "lamport": int(anchor["lamport"]),
+            "clientId": anchor["clientId"],
+        },
+        "cut": {"vv": cut_version_vector(anchor), "opCount": len(cut_ops)},
+        "thenView": then_view,
+        "diff": diff_views(then_view, now_view),
+    }
+
+
 def version_vector(ops: list[dict]) -> dict[str, int]:
     vv: dict[str, int] = {}
     for op in ops:

@@ -246,6 +246,66 @@ def test_import_foreign_play_with_colliding_opids_rejected(client):
         "imported": 0, "skipped": 1}
 
 
+def test_history_endpoint_causal_cut_read_only(client):
+    """GET /history returns the VV-cut diff and never mutates the log."""
+    r = client.post("/api/plays", json={"title": "历史对照测试"})
+    pid = r.json()["playId"]
+    with client.websocket_connect(f"/ws/{pid}") as wx, \
+         client.websocket_connect(f"/ws/{pid}") as wy:
+        _hello(wx, "HX")
+        _hello(wy, "HY")
+        add = _op(1, "HX", "add", "scene", "sc1", 1, {"HX": 0},
+                  {"name": "开场", "start": 0, "duration": 10000})
+        wx.send_json({"type": "op", "op": add})
+        assert _recv_until(wx, "op-ack")["opId"] == "1@HX"
+        assert _recv_until(wy, "op")["op"]["opId"] == "1@HX"
+
+        # HY's first op is causally known to HX's later rename
+        known = _op(1, "HY", "add", "sound", "snd1", 3, {"HX": 1, "HY": 0},
+                    {"name": "雷", "start": 2000, "duration": 1000})
+        wy.send_json({"type": "op", "op": known})
+        assert _recv_until(wy, "op-ack")["opId"] == "1@HY"
+        assert _recv_until(wx, "op")["op"]["opId"] == "1@HY"
+
+        anchor = _op(2, "HX", "rename", "scene", "sc1", 4,
+                     {"HX": 1, "HY": 1}, {"name": "开幕"})
+        wx.send_json({"type": "op", "op": anchor})
+        assert _recv_until(wx, "op-ack")["opId"] == "2@HX"
+        assert _recv_until(wy, "op")["op"]["opId"] == "2@HX"
+
+        # op strictly after the anchor's causal cut
+        after = _op(2, "HY", "add", "sound", "snd2", 5,
+                    {"HX": 2, "HY": 1},
+                    {"name": "雨", "start": 8000, "duration": 1000})
+        wy.send_json({"type": "op", "op": after})
+        assert _recv_until(wy, "op-ack")["opId"] == "2@HY"
+        assert _recv_until(wx, "op")["op"]["opId"] == "2@HY"
+
+    resp = client.get(f"/api/plays/{pid}/history", params={"opId": "2@HX"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["anchor"]["opId"] == "2@HX"
+    # causal cut: anchor + its two causally-known predecessors, NOT 2@HY
+    assert data["cut"]["opCount"] == 3
+    assert data["cut"]["vv"] == {"HX": 2, "HY": 1}
+    assert [e["id"] for e in data["diff"]["added"]] == ["snd2"]
+    assert data["diff"]["changed"] == []
+    assert data["diff"]["removed"] == []
+
+    # unknown anchor op -> 404
+    assert client.get(f"/api/plays/{pid}/history",
+                      params={"opId": "99@nope"}).status_code == 404
+    assert client.get(f"/api/plays/nope/history",
+                      params={"opId": "2@HX"}).status_code == 404
+
+    # read-only: log length unchanged and state identical before/after
+    state1 = client.get(f"/api/plays/{pid}/state").json()
+    client.get(f"/api/plays/{pid}/history", params={"opId": "2@HX"})
+    state2 = client.get(f"/api/plays/{pid}/state").json()
+    assert state1 == state2
+    assert state1["opCount"] == 4
+
+
 def test_health_and_static_ui(client):
     assert client.get("/api/health").json()["ok"] is True
     page = client.get("/")

@@ -1,7 +1,10 @@
 // Quick equivalence check of static/engine.js against the Python scenarios.
 // Run: node tests/engine.node.mjs
 import assert from 'node:assert';
-import { fold, buildView, buildCueSheet, versionVector, clientSeq, snapshot, totalKey } from '../static/engine.js';
+import {
+  fold, buildView, buildCueSheet, versionVector, clientSeq, snapshot, totalKey,
+  cutVersionVector, causalCut, diffViews, historyComparison,
+} from '../static/engine.js';
 
 const op = (seq, cid, type, kind, elemId, lamport, vv = {}, payload = {}, parent) => {
   const o = { opId: `${seq}@${cid}`, type, kind, elemId, lamport, clientId: cid, vv, payload };
@@ -147,4 +150,91 @@ const add = (seq, cid, kind, elem, start, name, lamport = 1, vv, parent) =>
   assert.ok(!shown.has('sndDeleted') && !shown.has('aOrphan'));
 }
 
-console.log('JS engine: all 10 scenario groups passed');
+// 11. causal cut: VV-only, independent of lamport / arrival order
+{
+  const a = op(1, 'A', 'add', 'sound', 'snd', 1, { A: 0 },
+    { name: 'snd', start: 0, duration: 5000 });
+  // b: concurrent with the anchor, smaller lamport than it (a lamport cutoff
+  // would wrongly include it); d: causally known by the anchor, huge lamport
+  const b = op(1, 'B', 'delete', 'sound', 'snd', 2, { B: 0 });
+  const d = op(1, 'C', 'restore', 'sound', 'snd', 10, { A: 1, B: 0, C: 0 });
+  const anchor = op(2, 'A', 'rename', 'sound', 'snd', 11,
+    { A: 1, C: 1 }, { name: '新名' });
+  const ops = [a, b, d, anchor];
+
+  assert.deepEqual(cutVersionVector(anchor), { A: 2, C: 1 });
+  const cutIds = (list) => new Set(causalCut(list, anchor).map((o) => o.opId));
+  assert.deepEqual(cutIds(ops), new Set(['1@A', '1@C', '2@A']));
+  assert.deepEqual(cutIds([anchor, d, b, a]), cutIds(ops));
+  // inside the cut B's concurrent delete never happened: C restored it
+  const then = buildView(fold(causalCut(ops, anchor)));
+  assert.equal(then.elements.snd.deleted, false);
+  assert.equal(then.elements.snd.name, '新名');
+  // full fold sees the concurrent delete vs restore conflict
+  const full = buildView(fold(ops));
+  assert.ok(full.conflicts.some((c) => c.kind === 'delete-restore'));
+}
+
+// 12. history diff: added / removed(deleted) / changed aligned by id
+{
+  const a = add(1, 'A', 'scene', 'sc1', 0, '开场', 1, { A: 0 }, undefined);
+  // add() pins duration:5000; rebuild sc1 with duration 10000 via payload
+  a.payload.duration = 10000;
+  const b = op(1, 'B', 'add', 'action', 'ac1', 2, { A: 1, B: 0 },
+    { name: '动作1', start: 1000, duration: 3000 }, 'sc1');
+  const c = op(1, 'C', 'add', 'sound', 'snd1', 3, { A: 1, B: 1, C: 0 },
+    { name: '音效1', start: 2000, duration: 2000 });
+  const anchor = op(2, 'A', 'move', 'scene', 'sc1', 4,
+    { A: 1, B: 1, C: 1 }, { start: 5000 });
+  const later = [
+    op(3, 'A', 'rename', 'scene', 'sc1', 5,
+      { A: 2, B: 1, C: 1 }, { name: '序幕' }),
+    op(1, 'D', 'add', 'sound', 'snd2', 6, { A: 2, B: 1, C: 1, D: 0 },
+      { name: '音效2', start: 9000, duration: 1000 }),
+    op(2, 'B', 'move', 'action', 'ac1', 7,
+      { A: 2, B: 1, C: 1, D: 1 }, { duration: 4000 }),
+    op(2, 'C', 'delete', 'sound', 'snd1', 8,
+      { A: 2, B: 1, C: 1, D: 1 }),
+  ];
+  const all = [a, b, c, anchor, ...later];
+  const res = historyComparison(all, anchor);
+  assert.equal(res.cut.opCount, 4);
+  assert.deepEqual(res.cut.vv, { A: 2, B: 1, C: 1 });
+  assert.deepEqual(res.diff.added.map((e) => e.id), ['snd2']);
+  assert.deepEqual(res.diff.removed.map((e) => e.id), ['snd1']);
+  assert.equal(res.diff.removed[0].reason, 'deleted');
+  const changed = Object.fromEntries(res.diff.changed.map((e) => [e.id, e]));
+  assert.deepEqual(Object.keys(changed), ['sc1', 'ac1']);
+  assert.deepEqual(changed.sc1.changes, [{ field: 'name', from: '开场', to: '序幕' }]);
+  assert.deepEqual(changed.ac1.changes, [{ field: 'duration', from: 3000, to: 4000 }]);
+}
+
+// 13. removed reason: parent scene deleted shadows the action; parent move = change
+{
+  const sc1 = op(1, 'A', 'add', 'scene', 'sc1', 1, { A: 0 },
+    { name: '场次一', start: 0, duration: 20000 });
+  const sc2 = op(2, 'A', 'add', 'scene', 'sc2', 2, { A: 1 },
+    { name: '场次二', start: 20000, duration: 10000 });
+  const ac1 = op(1, 'B', 'add', 'action', 'ac1', 3, { A: 2, B: 0 },
+    { name: '动作1', start: 1000, duration: 3000 }, 'sc1');
+  const ac2 = op(1, 'C', 'add', 'action', 'ac2', 4, { A: 2, B: 1, C: 0 },
+    { name: '动作2', start: 2000, duration: 3000 }, 'sc1');
+  const anchor = op(2, 'B', 'move', 'action', 'ac1', 5,
+    { A: 2, B: 1, C: 1 }, { start: 1500 });
+  const later = [
+    op(3, 'B', 'move', 'action', 'ac1', 6, { A: 2, B: 2, C: 1 }, { parent: 'sc2' }),
+    op(3, 'A', 'delete', 'scene', 'sc1', 7, { A: 2, B: 2, C: 1 }),
+  ];
+  const all = [sc1, sc2, ac1, ac2, anchor, ...later];
+  const thenView = buildView(fold(causalCut(all, anchor)));
+  const nowView = buildView(fold(all));
+  const diff = diffViews(thenView, nowView);
+  assert.deepEqual(diff.added, []);
+  assert.deepEqual(diff.removed.map((e) => e.id), ['sc1', 'ac2']);
+  assert.equal(diff.removed[0].reason, 'deleted');
+  assert.equal(diff.removed[1].reason, 'parent-deleted');
+  assert.deepEqual(diff.changed.map((e) => e.id), ['ac1']);
+  assert.deepEqual(diff.changed[0].changes, [{ field: 'parent', from: 'sc1', to: 'sc2' }]);
+}
+
+console.log('JS engine: all 13 scenario groups passed');

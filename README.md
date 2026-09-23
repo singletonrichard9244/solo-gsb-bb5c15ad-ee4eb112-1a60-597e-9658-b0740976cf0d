@@ -69,6 +69,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    名称、时长。恰好在边界上的提示只归入一个场次；可见性与折叠视图一致（已删除
    元素、所属场次被删而隐藏的动作均不出现）。提示单不产生任何协作操作，可用
    「🖨 打印 / 另存 PDF」或浏览器 Ctrl+P 打印（自带打印样式，只输出提示单）。
+8. 右侧 **🕰 历史对照** 标签（或在「操作日志」任意一条操作上点 **🕰 对照**）生成
+   **只读历史对照视图**：以所选操作发出时的**版本向量加上该操作自身序号**构成
+   **因果切面**——只折叠被该 VV 支配的操作（**不按到达顺序、也不按 Lamport 值
+   截断**），作为固定不变的「当时」侧；「当前」侧折叠完整日志，随协作更新实时
+   重算。两侧的**可见**场次 / 动作 / 音效按**元素 ID** 对齐，列出：
+   - **新增**：当时不可见、当前可见的元素；
+   - **消失**：当时可见、当前不可见的元素（元素被删除，或动作因**所属场次被删除
+     而被遮蔽**——遮蔽动作一律按不可见处理，并标注原因）；
+   - **变化**：两侧均可见但 **名称 / 起点 / 时长 / 所属场次** 有差异的元素，逐字段
+     列出旧值 → 新值。
+
+   历史切面一旦选定即固定（只随当前侧变化而变化）；**切换剧目自动清空选择**；
+   选择、查看、清除均为本地视图状态，**全程不产生任何编辑操作**。
 
 ### 多人协作同一房间
 
@@ -124,6 +137,7 @@ fold 是操作日志集合的纯函数——收到相同操作集合的任意客
 | 动作所属场次被删 | 动作在视图中隐藏（不删除数据），场次恢复后自动回归 |
 | 元素排序 | 场景/音效/动作均按 `(开始时间, createKey)` 稳定排序 |
 | 场次提示单 | 只读视图：列出半开区间 `[场次起点, 场次终点)` 内开始的可见动作与音效，按同一稳定序排列，附相对起点时间与时长；纯读取折叠视图，不产生操作 |
+| 历史对照（因果切面） | 只读视图：以锚点操作的 VV（并入其自身序号）为**因果切面**，仅折叠被 VV 支配的操作——不按到达顺序或 Lamport 值截断；当时/当前两侧可见元素按 ID 对齐，列出新增、消失（含场次删除导致的动作遮蔽）及名称/起点/时长/所属场次变化；历史侧固定、当前侧随协作更新，不产生操作 |
 
 冲突分三类显式呈现：`edit`（并发字段编辑，含全部候选值）、`delete`（删除×编辑）、
 `delete-restore`（删除×恢复）。
@@ -148,6 +162,7 @@ fold 是操作日志集合的纯函数——收到相同操作集合的任意客
 | POST | `/api/plays` | 新建剧目 `{"title": "..."}` |
 | PATCH | `/api/plays/{id}` | 重命名 |
 | GET | `/api/plays/{id}/state` | 服务端 fold 视图 + VV |
+| GET | `/api/plays/{id}/history?opId=<opId>` | 只读历史对照：锚点操作的因果切面 vs 当前完整日志（新增/消失/变化） |
 | GET | `/api/plays/{id}/export` | 导出 JSON |
 | POST | `/api/plays/{id}/import` | 合并导入 |
 | POST | `/api/import` | 导入为新剧目 |
@@ -163,19 +178,20 @@ WebSocket 消息：`hello` / `snapshot` / `op` / `op-ack` / `op-rejected` /
 
 ```
 app/
-  engine.py     # 确定性合并引擎：fold / build_view / VV（纯函数）
+  engine.py     # 确定性合并引擎：fold / build_view / VV / 因果切面历史对照（纯函数）
   db.py         # aiosqlite：plays 表 + ops 追加日志（opId 幂等）
   ws.py         # WebSocket 管理器：校验、增量快照、在线成员、心跳
-  main.py       # FastAPI：REST、导入导出、静态托管
+  main.py       # FastAPI：REST、导入导出、历史对照、静态托管
 static/
   index.html    # 时间线、侧栏、加入页
   style.css
-  engine.js     # 与 engine.py 等价的 JS 合并引擎
-  app.js        # 状态、WS 客户端、离线队列、拖拽与渲染
+  engine.js     # 与 engine.py 等价的 JS 合并引擎（含历史对照）
+  app.js        # 状态、WS 客户端、离线队列、拖拽与渲染（含只读历史对照面板）
 tests/
-  test_engine.py       # 合并语义（10 个场景）
-  test_integration.py  # REST + WebSocket 端到端（并发/重连/导入导出）
-  engine.node.mjs      # JS 引擎等价性检查
+  test_engine.py       # 合并语义（并发/因果/删除恢复/排序/只读场次提示单）
+  test_history.py      # 因果切面 + 历史对照差异（新增/消失/遮蔽/变化）
+  test_integration.py  # REST + WebSocket 端到端（并发/重连/导入导出/历史对照）
+  engine.node.mjs      # JS 引擎等价性检查（13 个场景组）
 docker-compose.yml / Dockerfile / requirements.txt
 ```
 
@@ -183,6 +199,6 @@ docker-compose.yml / Dockerfile / requirements.txt
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/        # 16 项：合并语义（含只读场次提示单）+ 服务端端到端
+python -m pytest tests/        # 合并语义 + 只读历史对照 + 服务端端到端
 node tests/engine.node.mjs     # JS 引擎等价性
 ```

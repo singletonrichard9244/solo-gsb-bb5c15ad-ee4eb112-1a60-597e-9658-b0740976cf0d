@@ -2,7 +2,10 @@
 // 剧场排练时序编排 — 前端客户端
 // 操作日志 + Lamport 时钟；断线写本地队列，重连按版本向量合并
 // ============================================================================
-import { fold, buildView, buildCueSheet, versionVector, clientSeq, totalKey, cmpKey } from './engine.js';
+import {
+  fold, buildView, buildCueSheet, versionVector, clientSeq, totalKey, cmpKey,
+  historyComparison,
+} from './engine.js';
 
 const SNAP_MS = 250;                       // 拖拽吸附粒度
 const PX_PER_MS = 0.024;                   // 24px / 秒
@@ -73,6 +76,7 @@ const state = {
   closing: false,
   selectedId: null,
   cueSceneId: null,        // 只读提示单当前场次（本地视图状态，不产生操作）
+  historyOpId: null,       // 历史对照锚点操作 ID（本地只读选择，不产生操作）
   dragging: null,          // {id, origStart, origX, width}
   suppressDetail: false,
 };
@@ -449,6 +453,7 @@ function render() {
   renderCue();
   renderConflicts();
   renderLog();
+  renderHistory();
 }
 
 // ----------------------------------------------------------------- drag ----
@@ -827,15 +832,176 @@ function renderConflicts() {
   }
 }
 
+// -------------------------------------------------------- history diff ----
+// 只读历史对照：锚点操作的 VV + 自身序号构成因果切面；历史侧固定，当前侧随
+// 协作更新。选择/清除都是纯本地视图状态，全程不产生任何编辑操作。
+const TYPE_LABEL = {
+  add: '新建', move: '移动', rename: '重命名', delete: '删除', restore: '恢复',
+};
+const REASON_LABEL = {
+  deleted: '元素已删除',
+  'parent-deleted': '所属场次被删除（动作按不可见处理）',
+};
+
+function selectHistoryAnchor(opId) {
+  if (!state.ops.has(opId)) return;
+  state.historyOpId = opId;
+  switchTab('history');
+  renderHistory();
+  renderLog();
+}
+
+function clearHistoryAnchor() {
+  state.historyOpId = null;
+  renderHistory();
+  renderLog();
+}
+
+function histValue(elements, field, value) {
+  if (value === null || value === undefined) return '—';
+  if (field === 'start') return fmtTime(value);
+  if (field === 'duration') return value + ' ms';
+  if (field === 'parent') {
+    const scene = elements[value];
+    return scene ? `「${scene.name}」` : `（不可见场次 ${shortId(value)}）`;
+  }
+  return String(value);
+}
+
+function histEntryName(entry, thenElements, nowElements) {
+  const side = entry.status === 'removed' ? entry.then : entry.now;
+  if (side && side.name) return side.name;
+  // 两侧都拿不到名称（极少见）时退回元素表
+  const e = nowElements[entry.id] || thenElements[entry.id];
+  return e ? e.name : shortId(entry.id);
+}
+
+function histFieldRows(fields, snap, elements) {
+  return fields
+    .map((f) => `<div class="hf-row"><span class="hf-k">${fmtField(f)}</span>
+      <span class="hf-v">${histValue(elements, f, snap[f])}</span></div>`)
+    .join('');
+}
+
+function renderHistory() {
+  const box = $('#history-content');
+  if (!box) return;
+  box.innerHTML = '';
+
+  const anchor = state.historyOpId ? state.ops.get(state.historyOpId) : null;
+  if (!anchor) {
+    box.innerHTML = `<div class="muted small pad history-hint">
+      在「操作日志」中点击任意一条操作右侧的 <b>🕰 对照</b>，即可以该操作的
+      <b>因果切面</b>（其版本向量加上自身序号，只折叠切面内的操作——不按到达顺序或
+      Lamport 值截断）为固定的历史侧，与随协作实时更新的当前侧做只读对照。<br/><br/>
+      对照按元素 ID 对齐当时与当前可见的场次、动作、音效，列出新增、消失，以及名称、
+      起点、时长、所属场次的变化；所属场次被删除而遮蔽的动作按不可见处理。
+      切换剧目会清空选择，本视图不产生任何编辑操作。
+    </div>`;
+    return;
+  }
+
+  const all = [...state.ops.values()];
+  const cmp = historyComparison(all, anchor);
+  const thenView = cmp.thenView;
+  const { added, removed, changed } = cmp.diff;
+  const nowElements = state.view.elements;
+  const thenElements = thenView.elements;
+
+  const head = document.createElement('div');
+  head.className = 'hist-head pad';
+  const anchorElem = nowElements[anchor.elemId] || thenView.elements[anchor.elemId];
+  head.innerHTML = `
+    <div class="hist-title">🕰 历史对照 · 只读</div>
+    <div class="hist-anchor small">
+      <span class="mono">L${anchor.lamport} ${shortId(anchor.opId)}</span>
+      ${whoTag(anchor.clientId)}
+      <span>${TYPE_LABEL[anchor.type] || anchor.type} · ${KIND_LABEL[anchor.kind]}
+      「${anchorElem?.name ?? shortId(anchor.elemId)}」</span>
+    </div>
+    <div class="hist-cut small muted">切面版本向量：<span class="mono">${
+      JSON.stringify(cmp.cut.vv)
+    }</span> · 切面内操作 ${cmp.cut.opCount} 条（当前日志 ${all.length} 条）</div>
+    <div class="hist-note small muted">历史侧固定为该操作的因果切面：仅折叠被其版本向量支配的操作，
+      不按到达顺序、也不按 Lamport 值截断；当前侧随协作更新实时重算。</div>
+    <div class="btn-row" style="margin-top:8px"><button id="btn-history-clear">✕ 清除对照选择</button></div>`;
+  box.appendChild(head);
+  head.querySelector('#btn-history-clear').addEventListener('click', clearHistoryAnchor);
+
+  const sum = document.createElement('div');
+  sum.className = 'hist-sum pad';
+  sum.innerHTML = `<span class="h-add">新增 ${added.length}</span>
+    <span class="h-remove">消失 ${removed.length}</span>
+    <span class="h-change">变化 ${changed.length}</span>`;
+  box.appendChild(sum);
+
+  const renderEntry = (entry) => {
+    const item = document.createElement('div');
+    item.className = `hist-item hist-${entry.status}`;
+    const name = histEntryName(entry, thenElements, nowElements);
+    let body = '';
+    if (entry.status === 'added') {
+      body = histFieldRows(
+        entry.kind === 'action' ? ['name', 'start', 'duration', 'parent'] : ['name', 'start', 'duration'],
+        entry.now, nowElements);
+    } else if (entry.status === 'removed') {
+      body = histFieldRows(
+        entry.kind === 'action' ? ['name', 'start', 'duration', 'parent'] : ['name', 'start', 'duration'],
+        entry.then, thenElements);
+      if (entry.reason) {
+        body += `<div class="hf-reason small">${REASON_LABEL[entry.reason] || entry.reason}</div>`;
+      }
+    } else {
+      body = entry.changes.map((c) => `
+        <div class="hf-row hf-changed">
+          <span class="hf-k">${fmtField(c.field)}</span>
+          <span class="hf-old">${histValue(thenElements, c.field, c.from)}</span>
+          <span class="hf-arrow">→</span>
+          <span class="hf-new">${histValue(nowElements, c.field, c.to)}</span>
+        </div>`).join('');
+    }
+    item.innerHTML = `<div class="hist-e-title">
+        <span class="hist-tag ${entry.kind}-tag">${KIND_LABEL[entry.kind]}</span>
+        <span class="hist-badge">${entry.status === 'added' ? '新增' : entry.status === 'removed' ? '消失' : '变化'}</span>
+        <b>${name}</b><span class="mono small muted">${shortId(entry.id)}</span>
+      </div>${body}`;
+    return item;
+  };
+
+  const sections = [
+    ['新增', added, 'h-add'],
+    ['消失', removed, 'h-remove'],
+    ['名称 / 起点 / 时长 / 所属场次变化', changed, 'h-change'],
+  ];
+  for (const [label, list, cls] of sections) {
+    const sec = document.createElement('div');
+    sec.className = `hist-sec ${cls}`;
+    sec.innerHTML = `<div class="hist-sec-title small">${label}（${list.length}）</div>`;
+    if (!list.length) {
+      sec.insertAdjacentHTML('beforeend', '<div class="muted small hist-empty">无</div>');
+    } else {
+      for (const entry of list) sec.appendChild(renderEntry(entry));
+    }
+    box.appendChild(sec);
+  }
+}
+
 // ------------------------------------------------------------------- log ----
 function renderLog() {
   const box = $('#log-list');
   const pending = new Set(state.queue.map((o) => o.opId));
   const ops = [...state.ops.values()].sort((a, b) => cmpKey(b, a)).slice(0, 200);
   box.innerHTML = '';
+  if (!ops.length) {
+    box.innerHTML = '<div class="muted small pad">还没有任何操作 —— 在时间线上创建元素后，可在此选定一条操作查看历史对照。</div>';
+    return;
+  }
   for (const op of ops) {
     const line = document.createElement('div');
-    line.className = 'log-line' + (pending.has(op.opId) ? ' pending' : '');
+    const isAnchor = op.opId === state.historyOpId;
+    line.className = 'log-line'
+      + (pending.has(op.opId) ? ' pending' : '')
+      + (isAnchor ? ' anchor' : '');
     const elem = state.view.elements[op.elemId];
     const w = who(op.clientId);
     let detail = '';
@@ -845,16 +1011,22 @@ function renderLog() {
         `${fmtField(k)}=${fmtValue(elem, k, v)}`).join(', ');
     line.innerHTML = `<span class="lo-id mono">L${op.lamport} ${shortId(op.opId)}</span>
       <i style="width:8px;height:8px;border-radius:50%;background:${w.color};display:inline-block"></i>
-      <span>${op.type} · ${KIND_LABEL[op.kind]}「${elem?.name ?? shortId(op.elemId)}」 ${detail}</span>`;
+      <span class="lo-text">${op.type} · ${KIND_LABEL[op.kind]}「${elem?.name ?? shortId(op.elemId)}」 ${detail}</span>
+      <button class="lo-cmp" title="以该操作的因果切面与当前时间线对照（只读）">${isAnchor ? '✓ 对照中' : '🕰 对照'}</button>`;
+    // 点击行仍按原行为选中元素；对照按钮仅设置只读锚点，二者互不产生编辑操作
     line.addEventListener('click', () => selectElement(op.elemId));
     line.style.cursor = 'pointer';
+    line.querySelector('.lo-cmp').addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectHistoryAnchor(op.opId);
+    });
     box.appendChild(line);
   }
 }
 
 // ------------------------------------------------------------------ tabs ----
 function switchTab(name) {
-  for (const t of ['detail', 'cue', 'conflict', 'log']) {
+  for (const t of ['detail', 'cue', 'conflict', 'log', 'history']) {
     $(`#tab-${t}`).classList.toggle('active', t === name);
     $(`#panel-${t}`).classList.toggle('hidden', t !== name);
   }
@@ -864,6 +1036,7 @@ function bindTabs() {
   $('#tab-cue').addEventListener('click', () => switchTab('cue'));
   $('#tab-conflict').addEventListener('click', () => switchTab('conflict'));
   $('#tab-log').addEventListener('click', () => switchTab('log'));
+  $('#tab-history').addEventListener('click', () => switchTab('history'));
 }
 
 // --------------------------------------------------------- import/export ----
@@ -943,6 +1116,7 @@ function enterPlay(playId, title) {
   state.serverVV = {};
   state.selectedId = null;
   state.cueSceneId = null;
+  state.historyOpId = null;   // 切换剧目清空历史对照选择
   location.hash = `#/play/${playId}`;
   $('#join-overlay').classList.add('hidden');
   $('#app').classList.remove('hidden');

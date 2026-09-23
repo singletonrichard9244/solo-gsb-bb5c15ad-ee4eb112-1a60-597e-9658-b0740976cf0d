@@ -256,6 +256,144 @@ export function buildView(state) {
   };
 }
 
+// ------------------------------------------------------------- history ----
+const KIND_ORDER = { scene: 0, action: 1, sound: 2 };
+const COMPARE_FIELDS = ['name', 'start', 'duration'];
+
+// VV defining the causal cut at anchor: its emitted VV predates the op
+// itself, so the anchor's own (clientId, seq) is added (max-wins).
+export function cutVersionVector(anchor) {
+  const cutoff = {};
+  for (const [k, v] of Object.entries(anchor.vv || {})) cutoff[String(k)] = parseInt(v, 10);
+  const cid = String(anchor.clientId);
+  cutoff[cid] = Math.max(cutoff[cid] || 0, clientSeq(anchor));
+  return cutoff;
+}
+
+// Ops in the causal past of anchor (anchor included). Membership is decided
+// ONLY by the cut version vector — never by arrival order or Lamport value:
+// a concurrent op with a smaller lamport stays out; a causally-known op with
+// a larger lamport stays in.
+export function causalCut(allOps, anchor) {
+  const byId = new Map();
+  for (const op of allOps) if (!byId.has(op.opId)) byId.set(op.opId, op);
+  const cutoff = cutVersionVector(anchor);
+  return [...byId.values()].filter(
+    (op) => parseInt(cutoff[op.clientId] || 0, 10) >= clientSeq(op),
+  );
+}
+
+// elemId -> element for everything the folded view actually shows; actions
+// hidden behind a deleted/absent parent scene are intentionally absent.
+function visibleRecords(view) {
+  const recs = new Map();
+  for (const scene of view.scenes || []) {
+    recs.set(scene.id, scene);
+    for (const act of scene.actions || []) recs.set(act.id, act);
+  }
+  for (const snd of view.sounds || []) recs.set(snd.id, snd);
+  return recs;
+}
+
+function fieldSnapshot(elem) {
+  const snap = {
+    name: elem.name,
+    start: elem.start,
+    duration: elem.duration,
+  };
+  if (elem.kind === 'action') snap.parent = elem.parent ?? null;
+  return snap;
+}
+
+function invisibleReason(elemId, nowElements) {
+  const elem = nowElements[elemId];
+  if (!elem) return null;
+  if (elem.deleted) return 'deleted';
+  if (elem.kind === 'action') {
+    const parent = nowElements[elem.parent];
+    if (!parent || parent.deleted) return 'parent-deleted';
+  }
+  return null;
+}
+
+// Align visible elements of two folded views by element ID.
+// Returns {added, removed, changed}; removed entries whose parent scene was
+// deleted carry reason 'parent-deleted' — the shadowed action counts as
+// invisible, matching the folded view.
+export function diffViews(thenView, nowView) {
+  const thenRecs = visibleRecords(thenView);
+  const nowRecs = visibleRecords(nowView);
+  const diff = { added: [], removed: [], changed: [] };
+  const kindOrder = (id) => {
+    const e = nowRecs.get(id) || thenRecs.get(id);
+    return KIND_ORDER[e.kind] ?? Object.keys(KIND_ORDER).length;
+  };
+  const ids = [...new Set([...thenRecs.keys(), ...nowRecs.keys()])]
+    .sort((a, b) => kindOrder(a) - kindOrder(b) || (a < b ? -1 : a > b ? 1 : 0));
+
+  for (const elemId of ids) {
+    const thenE = thenRecs.get(elemId);
+    const nowE = nowRecs.get(elemId);
+    if (!thenE) {
+      diff.added.push({
+        id: elemId, kind: nowE.kind, status: 'added',
+        then: null, now: fieldSnapshot(nowE),
+      });
+      continue;
+    }
+    if (!nowE) {
+      diff.removed.push({
+        id: elemId, kind: thenE.kind, status: 'removed',
+        then: fieldSnapshot(thenE), now: null,
+        reason: invisibleReason(elemId, nowView.elements || {}),
+      });
+      continue;
+    }
+    const fields = [...COMPARE_FIELDS, ...(nowE.kind === 'action' ? ['parent'] : [])];
+    const a = fieldSnapshot(thenE);
+    const b = fieldSnapshot(nowE);
+    const changes = [];
+    for (const field of fields) {
+      if (a[field] !== b[field]) changes.push({ field, from: a[field], to: b[field] });
+    }
+    if (changes.length) {
+      diff.changed.push({
+        id: elemId, kind: nowE.kind, status: 'changed',
+        then: a, now: b, changes,
+      });
+    }
+  }
+
+  for (const list of Object.values(diff)) {
+    list.sort((a, b) =>
+      (KIND_ORDER[a.kind] ?? 9) - (KIND_ORDER[b.kind] ?? 9) ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+  return diff;
+}
+
+// Read-only then-vs-now comparison at the causal cut of anchor. The history
+// side is fixed by the anchor's VV + own seq; the current side folds allOps
+// and follows live collaboration updates. Pure function — emits no ops.
+export function historyComparison(allOps, anchor) {
+  const cutOps = causalCut(allOps, anchor);
+  const thenView = buildView(fold(cutOps));
+  const nowView = buildView(fold(allOps));
+  return {
+    anchor: {
+      opId: anchor.opId,
+      type: anchor.type,
+      kind: anchor.kind,
+      elemId: anchor.elemId,
+      lamport: parseInt(anchor.lamport, 10),
+      clientId: anchor.clientId,
+    },
+    cut: { vv: cutVersionVector(anchor), opCount: cutOps.length },
+    thenView,
+    diff: diffViews(thenView, nowView),
+  };
+}
+
 export function versionVector(ops) {
   const vv = {};
   for (const op of ops) {
