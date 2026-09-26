@@ -1,7 +1,8 @@
 // Quick equivalence check of static/engine.js against the Python scenarios.
 // Run: node tests/engine.node.mjs
 import assert from 'node:assert';
-import { fold, buildView, buildCueSheet, versionVector, clientSeq, snapshot, totalKey } from '../static/engine.js';
+import { fold, buildView, buildCueSheet, versionVector, clientSeq, snapshot, totalKey,
+  causalCutVV, opsInCut, viewAtCut, diffViews } from '../static/engine.js';
 
 const op = (seq, cid, type, kind, elemId, lamport, vv = {}, payload = {}, parent) => {
   const o = { opId: `${seq}@${cid}`, type, kind, elemId, lamport, clientId: cid, vv, payload };
@@ -147,4 +148,69 @@ const add = (seq, cid, kind, elem, start, name, lamport = 1, vv, parent) =>
   assert.ok(!shown.has('sndDeleted') && !shown.has('aOrphan'));
 }
 
-console.log('JS engine: all 10 scenario groups passed');
+// 11. read-only history compare: causal cut membership + view diff
+{
+  const a1 = add(1, 'A', 'scene', 's1', 0, '开场');
+  const b1 = add(1, 'B', 'sound', 'sd1', 2000, '雷声', 1, { B: 0 });
+  const e1 = add(1, 'E', 'scene', 'sDel', 40000, '将被删', 2, { E: 0 });
+  const e2 = add(2, 'E', 'action', 'actD', 41000, '旧动作', 3, { E: 1 }, 'sDel');
+  const anchor = add(2, 'A', 'action', 'act1', 1000, '动作一', 4,
+    { A: 1, B: 1, E: 2 }, 's1');
+  const a3 = op(3, 'A', 'rename', 'scene', 's1', 5, { A: 2 }, { name: '开幕' });
+  const a4 = op(4, 'A', 'move', 'action', 'act1', 6, { A: 3 }, { start: 1500 });
+  const c1 = add(1, 'C', 'scene', 's2', 20000, '第二幕', 7, { A: 4, C: 0 });
+  const a5 = op(5, 'A', 'move', 'action', 'act1', 8, { A: 4, C: 1 }, { parent: 's2' });
+  const b2 = op(2, 'B', 'delete', 'sound', 'sd1', 9, { A: 2, B: 1 });
+  const e3 = op(3, 'E', 'delete', 'scene', 'sDel', 10, { E: 2 });
+  const d1 = add(1, 'D', 'scene', 'sGone', 50000, '废弃场', 11, { D: 0 });
+  const d2 = add(2, 'D', 'action', 'actHidden', 51000, '被遮蔽', 12, { D: 1 }, 'sGone');
+  const d3 = op(3, 'D', 'delete', 'scene', 'sGone', 13, { D: 2 });
+  const log = [a1, b1, e1, e2, anchor, a3, a4, c1, a5, b2, e3, d1, d2, d3];
+
+  const cut = causalCutVV(anchor);
+  assert.deepEqual(cut, { A: 2, B: 1, E: 2 });
+
+  const hist = viewAtCut(log, cut);
+  assert.deepEqual(hist.scenes.map((s) => s.id), ['s1', 'sDel']);
+  assert.deepEqual(hist.sounds.map((s) => s.id), ['sd1']);
+
+  const now = buildView(fold(log));
+  const diff = diffViews(hist, now);
+  assert.deepEqual(diff.added.map((e) => e.id), ['s2']);
+  assert.deepEqual(new Set(diff.removed.map((e) => e.id)),
+    new Set(['sd1', 'sDel', 'actD']));
+  const flat = new Set([...diff.added, ...diff.removed, ...diff.changed]
+    .map((e) => e.id));
+  assert.ok(!flat.has('sGone') && !flat.has('actHidden'));
+  const changed = Object.fromEntries(diff.changed.map((c) => [c.id, c]));
+  assert.deepEqual(Object.keys(changed).sort(), ['act1', 's1']);
+  assert.deepEqual(changed.s1.fields, [{ field: 'name', from: '开场', to: '开幕' }]);
+  assert.deepEqual(changed.act1.fields, [
+    { field: 'start', from: 1000, to: 1500 },
+    { field: 'parent', from: 's1', to: 's2' },
+  ]);
+}
+
+// 12. cut membership ignores lamport values and arrival order
+{
+  const o1 = add(1, 'A', 'scene', 's1', 0);
+  const o2 = op(2, 'A', 'move', 'scene', 's1', 2, { A: 1 }, { start: 1000 });
+  const anchor = op(3, 'A', 'move', 'scene', 's1', 3, { A: 2, B: 2 }, { start: 2000 });
+  const hi = op(2, 'B', 'move', 'scene', 's1', 99, { A: 2, B: 1 }, { start: 9000 });
+  const lo = op(3, 'B', 'move', 'scene', 's1', 1, { B: 2 }, { start: 7000 });
+  const late = op(4, 'A', 'move', 'scene', 's1', 4, { A: 3 }, { start: 500 });
+
+  const cut = causalCutVV(anchor);
+  assert.deepEqual(cut, { A: 3, B: 2 });
+  const log = [o1, o2, anchor, hi, lo, late];
+  const inside = new Set(opsInCut(log, cut).map((o) => o.opId));
+  assert.deepEqual([...inside].sort(), ['1@A', '2@A', '2@B', '3@A']);
+  const insideRev = new Set(opsInCut([...log].reverse(), cut).map((o) => o.opId));
+  assert.deepEqual([...insideRev].sort(), [...inside].sort());
+  const hist = viewAtCut(log, cut);
+  // 2@B (lamport 99) wins inside the cut; 3@B (lamport 1) and 4@A stay out
+  assert.equal(hist.scenes[0].start, 9000);
+  assert.equal(hist.conflicts.length, 0);
+}
+
+console.log('JS engine: all 12 scenario groups passed');

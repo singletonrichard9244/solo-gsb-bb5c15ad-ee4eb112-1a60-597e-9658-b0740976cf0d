@@ -199,7 +199,7 @@ button.danger { background: var(--danger); border-color: var(--danger); color: #
 .tabs { display: flex; flex: none; border-bottom: 1px solid var(--line); }
 .tab {
   flex: 1; border: none; border-radius: 0; background: transparent;
-  padding: 12px; color: var(--muted); border-bottom: 2px solid transparent;
+  padding: 12px 4px; font-size: 13px; color: var(--muted); border-bottom: 2px solid transparent;
 }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); background: var(--panel-2); }
 .badge {
@@ -241,6 +241,45 @@ button.danger { background: var(--danger); border-color: var(--danger); color: #
 .log-line .lo-id { color: var(--muted); flex: none; }
 .log-line.pending { color: #facc15; }
 .log-line.pending .lo-id::after { content: " ⏳"; }
+.log-line.anchor { background: rgba(99,102,241,.16); box-shadow: inset 3px 0 0 var(--accent); }
+.log-line .lo-cut {
+  margin-left: auto; flex: none; padding: 0 6px; font-size: 11px;
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+}
+.log-line .lo-cut:hover { border-color: var(--accent); }
+
+/* ---------- read-only history compare ---------- */
+.hist-head { border-bottom: 1px solid var(--line); }
+.hist-title { font-weight: 700; margin-bottom: 4px; }
+.hist-vv { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.vv-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 9px; font-size: 11px;
+}
+.vv-chip i { width: 8px; height: 8px; border-radius: 50%; }
+.hist-note { line-height: 1.5; margin-bottom: 8px; }
+.hist-summary { border-bottom: 1px solid var(--line); }
+.hist-sec { padding: 10px 10px 0; font-weight: 700; font-size: 12px; }
+.hist-sec.added { color: var(--ok); }
+.hist-sec.removed { color: var(--danger); }
+.hist-sec.changed { color: #eab308; }
+.hist-item {
+  border: 1px solid var(--line); border-left: 3px solid var(--muted);
+  border-radius: 8px; margin: 6px 10px; padding: 8px 12px;
+  background: var(--panel-2); font-size: 12px;
+}
+.hist-item.added { border-left-color: var(--ok); }
+.hist-item.removed { border-left-color: var(--danger); }
+.hist-item.changed { border-left-color: #eab308; }
+.hist-item .h-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.hist-item .h-meta { color: var(--muted); margin-top: 3px; }
+.hist-item .h-field { display: flex; gap: 8px; margin-top: 4px; align-items: baseline; }
+.hist-item .h-field .f-name { color: var(--muted); flex: none; min-width: 60px; }
+.hist-item .h-field .f-old { text-decoration: line-through; color: var(--muted); }
+.hist-item.clickable { cursor: pointer; }
+.hist-item.clickable:hover { border-color: var(--accent); }
+.hist-empty { padding: 18px; text-align: center; color: var(--muted); }
 
 /* toast */
 .toast {
@@ -286,6 +325,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .action-tag { background: color-mix(in srgb, var(--action) 80%, white); }
 .sound-tag { background: color-mix(in srgb, var(--sound) 75%, white); }
+.scene-tag { background: color-mix(in srgb, var(--scene) 75%, white); }
 tr.cue-row { cursor: pointer; }
 tr.cue-row:hover { background: var(--panel-2); }
 tr.cue-row.selected { background: rgba(99,102,241,.18); box-shadow: inset 3px 0 0 var(--accent); }

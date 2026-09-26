@@ -63,6 +63,7 @@
       <div class="tabs">
         <button id="tab-detail" class="tab active">属性</button>
         <button id="tab-cue" class="tab">📋 提示单</button>
+        <button id="tab-history" class="tab">🕰 历史</button>
         <button id="tab-conflict" class="tab">冲突 <span id="conflict-count" class="badge hidden">0</span></button>
         <button id="tab-log" class="tab">操作日志</button>
       </div>
@@ -94,6 +95,10 @@
           <button id="btn-cue-print">🖨 打印 / 另存 PDF</button>
         </div>
         <div id="cue-content" class="cue-content"></div>
+      </div>
+
+      <div id="panel-history" class="panel hidden">
+        <div id="history-content" class="hist-content"></div>
       </div>
 
       <div id="panel-conflict" class="panel hidden">

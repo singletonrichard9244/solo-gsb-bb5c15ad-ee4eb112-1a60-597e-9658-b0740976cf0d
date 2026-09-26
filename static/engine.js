@@ -256,6 +256,86 @@ export function buildView(state) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Read-only history comparison: causal cut + view diff.  Pure functions —
+// no operations are ever emitted by this section.
+// ---------------------------------------------------------------------------
+
+// Causal cut anchored at `op`: the op's emit-time VV extended to cover the
+// op itself.  Everything the emitter had causally seen (plus the anchor)
+// is inside the cut; everything else is outside.
+export function causalCutVV(op) {
+  const vv = {};
+  for (const [k, v] of Object.entries(op.vv || {})) vv[String(k)] = parseInt(v, 10);
+  const cid = op.clientId;
+  vv[cid] = Math.max(vv[cid] || 0, clientSeq(op));
+  return vv;
+}
+
+// Ops inside the causal cut.  Membership is decided purely by per-client
+// sequence numbers covered by cutVV — never by lamport values and never by
+// arrival order, so the cut is a genuine causal slice of the log.
+export function opsInCut(ops, cutVV) {
+  return ops.filter((o) => parseInt(cutVV[o.clientId] || 0, 10) >= clientSeq(o));
+}
+
+// Fold only the in-cut ops into the ordered view the UI diffs against now.
+export function viewAtCut(ops, cutVV) {
+  return buildView(fold(opsInCut(ops, cutVV)));
+}
+
+// Elements visible in a folded view, keyed by id.  Deleted elements and
+// actions hidden by a deleted parent scene are already absent from the
+// view's scenes/actions/sounds, so they count as invisible on either side.
+function visibleElements(view) {
+  const vis = new Map();
+  for (const s of view.scenes || []) {
+    vis.set(s.id, s);
+    for (const a of s.actions || []) vis.set(a.id, a);
+  }
+  for (const snd of view.sounds || []) vis.set(snd.id, snd);
+  return vis;
+}
+
+// Align two folded views by element id: added / removed / changed with
+// per-field {field, from, to} records (name/start/duration, plus parent
+// for actions).  Only visible elements participate on both sides.
+export function diffViews(past, now) {
+  const before = visibleElements(past);
+  const after = visibleElements(now);
+  const brief = (e) => ({
+    id: e.id, kind: e.kind, name: e.name, start: e.start,
+    duration: e.duration, parent: e.parent ?? null, createKey: e.createKey,
+  });
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [id, oldE] of before) {
+    if (!after.has(id)) removed.push(brief(oldE));
+  }
+  for (const [id, newE] of after) {
+    const oldE = before.get(id);
+    if (!oldE) { added.push(brief(newE)); continue; }
+    const fields = [];
+    for (const f of ['name', 'start', 'duration']) {
+      if (oldE[f] !== newE[f]) fields.push({ field: f, from: oldE[f], to: newE[f] });
+    }
+    if (newE.kind === 'action' && (oldE.parent ?? null) !== (newE.parent ?? null)) {
+      fields.push({ field: 'parent', from: oldE.parent ?? null, to: newE.parent ?? null });
+    }
+    if (fields.length) {
+      changed.push({
+        id, kind: newE.kind, name: newE.name, start: newE.start,
+        createKey: newE.createKey, fields,
+      });
+    }
+  }
+  added.sort(cmpStartKey);
+  removed.sort(cmpStartKey);
+  changed.sort(cmpStartKey);
+  return { added, removed, changed };
+}
+
 export function versionVector(ops) {
   const vv = {};
   for (const op of ops) {

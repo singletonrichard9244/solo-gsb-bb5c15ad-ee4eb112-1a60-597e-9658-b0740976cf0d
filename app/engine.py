@@ -330,6 +330,112 @@ def build_view(state: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# Read-only history comparison: causal cut + view diff (pure functions,
+# no operations are ever emitted by this section).
+# --------------------------------------------------------------------------
+def causal_cut_vv(op: dict) -> dict[str, int]:
+    """Version vector of the causal cut anchored at ``op``.
+
+    The cut is the op's emit-time VV extended to cover the op itself (its
+    own per-client sequence): everything the emitter had causally seen,
+    plus the anchor op, is inside the cut; everything else is outside.
+    """
+    vv = {str(k): int(v) for k, v in (op.get("vv") or {}).items()}
+    cid = op["clientId"]
+    vv[cid] = max(vv.get(cid, 0), client_seq(op))
+    return vv
+
+
+def ops_in_cut(ops: list[dict], cut_vv: dict[str, int]) -> list[dict]:
+    """Ops inside the causal cut.
+
+    Membership is decided purely by per-client sequence numbers covered by
+    ``cut_vv`` — never by lamport values and never by arrival/insertion
+    order, so the cut is a genuine causal slice of the log.
+    """
+    return [
+        o for o in ops
+        if int(cut_vv.get(o["clientId"], 0)) >= client_seq(o)
+    ]
+
+
+def view_at_cut(ops: list[dict], cut_vv: dict[str, int]) -> dict:
+    """Fold only the ops inside the causal cut into the ordered view."""
+    return build_view(fold(ops_in_cut(ops, cut_vv)))
+
+
+def _visible_elements(view: dict) -> dict[str, dict]:
+    """Elements visible in a folded view, keyed by element id.
+
+    Deleted elements and actions hidden by a deleted parent scene are
+    already absent from the view's scenes/actions/sounds lists, so they
+    count as invisible on either side of the comparison.
+    """
+    vis: dict[str, dict] = {}
+    for scene in view["scenes"]:
+        vis[scene["id"]] = scene
+        for act in scene.get("actions", []):
+            vis[act["id"]] = act
+    for snd in view["sounds"]:
+        vis[snd["id"]] = snd
+    return vis
+
+
+def diff_views(past: dict, now: dict) -> dict:
+    """Align two folded views by element id and describe the differences.
+
+    Returns ``{"added": [...], "removed": [...], "changed": [...]}`` where
+    each changed entry carries per-field ``{field, from, to}`` records for
+    name/start/duration and — actions only — parent.  Only *visible*
+    elements participate on both sides, so an action hidden because its
+    parent scene was deleted simply vanishes from the comparison.
+    """
+    before = _visible_elements(past)
+    after = _visible_elements(now)
+
+    def brief(e: dict) -> dict:
+        return {
+            "id": e["id"],
+            "kind": e["kind"],
+            "name": e["name"],
+            "start": e["start"],
+            "duration": e["duration"],
+            "parent": e.get("parent"),
+            "createKey": e["createKey"],
+        }
+
+    added = [brief(after[i]) for i in after.keys() - before.keys()]
+    removed = [brief(before[i]) for i in before.keys() - after.keys()]
+    changed: list[dict] = []
+    for i in before.keys() & after.keys():
+        old, new = before[i], after[i]
+        fields = [
+            {"field": f, "from": old[f], "to": new[f]}
+            for f in ("name", "start", "duration")
+            if old[f] != new[f]
+        ]
+        if new["kind"] == "action" and old.get("parent") != new.get("parent"):
+            fields.append(
+                {"field": "parent",
+                 "from": old.get("parent"), "to": new.get("parent")}
+            )
+        if fields:
+            changed.append({
+                "id": i,
+                "kind": new["kind"],
+                "name": new["name"],
+                "start": new["start"],
+                "createKey": new["createKey"],
+                "fields": fields,
+            })
+
+    added.sort(key=_start_key)
+    removed.sort(key=_start_key)
+    changed.sort(key=_start_key)
+    return {"added": added, "removed": removed, "changed": changed}
+
+
 def version_vector(ops: list[dict]) -> dict[str, int]:
     vv: dict[str, int] = {}
     for op in ops:

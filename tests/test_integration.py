@@ -250,4 +250,7 @@ def test_health_and_static_ui(client):
     assert client.get("/api/health").json()["ok"] is True
     page = client.get("/")
     assert "剧场排练" in page.text
+    # read-only history compare tab + panel are part of the page
+    assert 'id="tab-history"' in page.text
+    assert 'id="history-content"' in page.text
     assert client.get("/static/engine.js").status_code == 200

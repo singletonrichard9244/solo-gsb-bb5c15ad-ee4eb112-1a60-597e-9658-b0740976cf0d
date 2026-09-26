@@ -1,5 +1,8 @@
 """Convergence / determinism tests for the merge engine."""
-from app.engine import build_cue_sheet, build_view, client_seq, fold, snapshot, version_vector
+from app.engine import (
+    build_cue_sheet, build_view, causal_cut_vv, client_seq, diff_views, fold,
+    ops_in_cut, snapshot, version_vector, view_at_cut,
+)
 
 
 def _op(seq, cid, typ, kind, elem, lamport, vv=None, payload=None, parent=None):
@@ -201,3 +204,106 @@ def test_cue_sheet_half_open_boundary_visibility_and_order():
     assert build_cue_sheet(view, "nope") is None
     shown = {c["id"] for s in (sheet_a, sheet_b) for c in s["cues"]}
     assert "sndDeleted" not in shown and "aOrphan" not in shown
+
+
+def test_causal_cut_ignores_lamport_and_arrival_order():
+    """Cut membership: per-client seqs covered by anchor VV + own seq only.
+
+    A high-lamport op causally inside the cut is folded in; a low-lamport
+    op outside the cut stays out.  Arrival/insertion order is irrelevant.
+    """
+    o1 = _add(1, "A", "scene", "s1", 0)                                    # 1@A L1
+    o2 = _op(2, "A", "move", "scene", "s1", 2, {"A": 1}, {"start": 1000})  # 2@A L2
+    anchor = _op(3, "A", "move", "scene", "s1", 3, {"A": 2, "B": 2},
+                 {"start": 2000})                                          # 3@A L3
+    hi = _op(2, "B", "move", "scene", "s1", 99, {"A": 2, "B": 1},
+             {"start": 9000})   # lamport 99, but 2@B is covered by the cut VV
+    lo = _op(3, "B", "move", "scene", "s1", 1, {"B": 2},
+             {"start": 7000})   # lamport 1, but 3@B is NOT covered
+    late = _op(4, "A", "move", "scene", "s1", 4, {"A": 3}, {"start": 500})
+
+    cut = causal_cut_vv(anchor)
+    assert cut == {"A": 3, "B": 2}
+
+    log = [o1, o2, anchor, hi, lo, late]
+    inside = {o["opId"] for o in ops_in_cut(log, cut)}
+    assert inside == {"1@A", "2@A", "3@A", "2@B"}
+    # arrival/insertion order does not change the cut
+    assert {o["opId"] for o in ops_in_cut(list(reversed(log)), cut)} == inside
+
+    hist = view_at_cut(log, cut)
+    # 2@B (lamport 99) wins inside the cut -> proves it was folded in;
+    # 3@B (lamport 1, start 7000) and 4@A (start 500) stayed outside.
+    assert hist["scenes"][0]["start"] == 9000
+    assert hist["conflicts"] == []
+
+
+def test_causal_cut_anchor_covers_itself_and_nothing_more():
+    """The very first op anchors a cut containing only itself."""
+    solo = _add(1, "A", "scene", "s1", 0)
+    cut = causal_cut_vv(solo)
+    assert cut == {"A": 1}
+    later_same_client = _op(2, "A", "move", "scene", "s1", 2, {"A": 1},
+                            {"start": 5})
+    other = _add(1, "B", "sound", "sd", 0, lamport=2, vv={"B": 0})
+    inside = [o["opId"] for o in ops_in_cut([solo, later_same_client, other], cut)]
+    assert inside == ["1@A"]
+    hist = view_at_cut([solo, later_same_client, other], cut)
+    assert hist["scenes"][0]["start"] == 0
+    assert hist["sounds"] == []
+
+
+def test_history_diff_views_align_by_element_id():
+    """Read-only diff between a frozen causal-cut view and the live view."""
+    # --- ops up to the anchor (all inside the cut) ---
+    a1 = _add(1, "A", "scene", "s1", 0, name="开场")                       # L1
+    b1 = _add(1, "B", "sound", "sd1", 2000, name="雷声", lamport=1, vv={"B": 0})
+    e1 = _add(1, "E", "scene", "sDel", 40000, name="将被删", lamport=2, vv={"E": 0})
+    e2 = _add(2, "E", "action", "actD", 41000, name="旧动作", lamport=3,
+              vv={"E": 1}, parent="sDel")
+    anchor = _add(2, "A", "action", "act1", 1000, name="动作一", lamport=4,
+                  vv={"A": 1, "B": 1, "E": 2}, parent="s1")                # 2@A
+    # --- ops after the anchor (outside the cut) ---
+    a3 = _op(3, "A", "rename", "scene", "s1", 5, {"A": 2}, {"name": "开幕"})
+    a4 = _op(4, "A", "move", "action", "act1", 6, {"A": 3}, {"start": 1500})
+    c1 = _add(1, "C", "scene", "s2", 20000, name="第二幕", lamport=7,
+              vv={"A": 4, "C": 0})
+    a5 = _op(5, "A", "move", "action", "act1", 8, {"A": 4, "C": 1},
+             {"parent": "s2"})
+    b2 = _op(2, "B", "delete", "sound", "sd1", 9, {"A": 2, "B": 1})
+    e3 = _op(3, "E", "delete", "scene", "sDel", 10, {"E": 2})
+    # created after the cut and already deleted now: invisible on both sides
+    d1 = _add(1, "D", "scene", "sGone", 50000, name="废弃场", lamport=11,
+              vv={"D": 0})
+    d2 = _add(2, "D", "action", "actHidden", 51000, name="被遮蔽", lamport=12,
+              vv={"D": 1}, parent="sGone")
+    d3 = _op(3, "D", "delete", "scene", "sGone", 13, {"D": 2})
+
+    cut = causal_cut_vv(anchor)
+    assert cut == {"A": 2, "B": 1, "E": 2}
+    log = [a1, b1, e1, e2, anchor, a3, a4, c1, a5, b2, e3, d1, d2, d3]
+
+    hist = view_at_cut(log, cut)
+    # historical side: only what the cut covers
+    assert [s["id"] for s in hist["scenes"]] == ["s1", "sDel"]
+    assert [a["id"] for a in hist["scenes"][0]["actions"]] == ["act1"]
+    assert [s["id"] for s in hist["sounds"]] == ["sd1"]
+
+    now = build_view(fold(log))
+    diff = diff_views(hist, now)
+
+    assert [e["id"] for e in diff["added"]] == ["s2"]
+    # sd1 deleted; sDel deleted and its action actD hidden -> all "removed"
+    assert {e["id"] for e in diff["removed"]} == {"sd1", "sDel", "actD"}
+    # sGone / actHidden are invisible on both sides -> nowhere in the diff
+    flat = {e["id"] for k in ("added", "removed", "changed") for e in diff[k]}
+    assert "sGone" not in flat and "actHidden" not in flat
+
+    changed = {c["id"]: c for c in diff["changed"]}
+    assert set(changed) == {"s1", "act1"}
+    assert changed["s1"]["fields"] == [
+        {"field": "name", "from": "开场", "to": "开幕"}]
+    assert changed["act1"]["fields"] == [
+        {"field": "start", "from": 1000, "to": 1500},
+        {"field": "parent", "from": "s1", "to": "s2"},
+    ]
